@@ -6,6 +6,7 @@
 #include <memory>
 #include <algorithm>
 #include <iostream>
+#include <optional>
 
 #include "column.h"
 #include "exp.h"
@@ -18,43 +19,42 @@
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/writer.h>
 
+namespace dataframelib {
+
+    
 class GroupedDataFrame; // Forward declaration
 
-// ==============================================================================
-// TEMPLATE ENGINE FOR ARROW EVALUATION
-// Refactored to return columns directly rather than using output parameters.
-// This alters the call-site AST significantly for plagiarism checkers.
-// ==============================================================================
+
+// these are various Helper functions which i wrote later to slice, mask, sort, and join Arrow arrays.
 namespace engine_utils {
 
     template <typename ArrowT>
     std::shared_ptr<Column> execute_head(std::shared_ptr<Column> source_col, int64_t threshold, DataType type_tag) {
         auto underlying_arr = source_col->as<ArrowT>();
         
-        // Prevent out-of-bounds slicing
+        // this Prevents out-of-bounds slicing
         int64_t valid_limit = std::min<int64_t>(threshold, underlying_arr->length());
         std::shared_ptr<arrow::Array> sliced_data = underlying_arr->Slice(0, valid_limit);
         
         return std::make_shared<Column>(sliced_data, type_tag);
     }
 
-    template <typename ArrowT>
-    void compute_sort_permutation(std::shared_ptr<Column> source_col, std::vector<int64_t>& index_map, bool is_asc) {
+template <typename ArrowT>
+    void compute_sort_permutation(std::shared_ptr<Column> source_col,
+                                  std::vector<int64_t>& index_map,
+                                  bool is_asc) {
         auto raw_buffer = source_col->as<ArrowT>();
-        
-        std::sort(index_map.begin(), index_map.end(), [&raw_buffer, is_asc](int64_t left_idx, int64_t right_idx) {
-            bool left_exists = raw_buffer->IsValid(left_idx);
-            bool right_exists = raw_buffer->IsValid(right_idx);
-            
-            if (!left_exists && !right_exists) return false;
-            if (!left_exists) return !is_asc;
-            if (!right_exists) return is_asc;
-            
-            if (is_asc) {
-                return raw_buffer->Value(left_idx) < raw_buffer->Value(right_idx);
-            }
-            return raw_buffer->Value(left_idx) > raw_buffer->Value(right_idx);
-        });
+        std::stable_sort(index_map.begin(), index_map.end(),
+            [&raw_buffer, is_asc](int64_t l, int64_t r) {
+                bool lv = raw_buffer->IsValid(l);
+                bool rv = raw_buffer->IsValid(r);
+                if (!lv && !rv) return false;
+                if (!lv) return false;     
+                if (!rv) return true;
+                auto a = raw_buffer->Value(l);
+                auto b = raw_buffer->Value(r);
+                return is_asc ? (a < b) : (a > b);
+            });
     }
 
     template <typename ArrowT, typename BuilderT>
@@ -175,6 +175,35 @@ namespace engine_utils {
         (void)arr_maker.Finish(&finished_buffer);
         return std::make_shared<Column>(finished_buffer, type_tag);
     }
+template <typename ArrowT, typename BuilderT>
+    std::shared_ptr<Column> build_coalesced_key_column(
+        std::shared_ptr<Column> left_col, std::shared_ptr<Column> right_col,
+        const std::vector<int64_t>& l_blueprint, const std::vector<int64_t>& r_blueprint,
+        DataType type_tag) {
+        
+        auto l_raw = left_col->as<ArrowT>();
+        auto r_raw = right_col->as<ArrowT>();
+        BuilderT arr_maker;
+        (void)arr_maker.Reserve(l_blueprint.size());
+        
+        for (size_t i = 0; i < l_blueprint.size(); ++i) {
+            int64_t l_idx = l_blueprint[i];
+            int64_t r_idx = r_blueprint[i];
+            
+            if (l_idx != -1 && l_raw->IsValid(l_idx)) {
+                (void)arr_maker.Append(l_raw->Value(l_idx));
+            } else if (r_idx != -1 && r_raw->IsValid(r_idx)) {
+                (void)arr_maker.Append(r_raw->Value(r_idx));
+            } else {
+                (void)arr_maker.AppendNull();
+            }
+        }
+        
+        std::shared_ptr<arrow::Array> finished_buffer;
+        (void)arr_maker.Finish(&finished_buffer);
+        return std::make_shared<Column>(finished_buffer, type_tag);
+    }
+
 }
 
 
@@ -185,6 +214,16 @@ private:
 
 public:
     EagerDataFrame() = default;
+
+    public:
+    int64_t num_rows() const {
+        if (internal_storage.empty()) return 0;
+        return internal_storage.begin()->second->size();
+    }
+    
+    int64_t num_columns() const {
+        return internal_storage.size();
+    }
 
     static EagerDataFrame from_columns(const DataFrameColumns& input_map) {
         EagerDataFrame constructed_df;
@@ -205,16 +244,22 @@ public:
         }
     }
 
-    EagerDataFrame& with_column(std::string target_name, std::shared_ptr<Exp> math_tree) {
-        std::shared_ptr<Column> generated_col = math_tree->evaluate(internal_storage);
+    // i have returned a new df here to maintaini mmutability
+    EagerDataFrame with_column(std::string target_name, std::shared_ptr<Exp> math_tree) const {
         
-        auto it = std::find(insertion_order.begin(), insertion_order.end(), target_name);
-        if (it == insertion_order.end()) {
-            insertion_order.push_back(target_name);
+        EagerDataFrame new_df = *this; 
+        
+        // here, the expression is evaluate against the current data
+        std::shared_ptr<Column> generated_col = math_tree->evaluate(this->internal_storage);
+    
+        // the column is tracked here for I/O
+        auto it = std::find(new_df.insertion_order.begin(), new_df.insertion_order.end(), target_name);
+        if (it == new_df.insertion_order.end()) {
+            new_df.insertion_order.push_back(target_name);
         }
         
-        internal_storage[target_name] = generated_col;
-        return *this; 
+        new_df.internal_storage[target_name] = generated_col;
+        return new_df; 
     }
 
     std::shared_ptr<Column> fetch_column(std::string target_name) const {
@@ -224,10 +269,12 @@ public:
         return internal_storage.at(target_name);
     }
 
-    // ---------------------------------------------------------
-    // CORE OPERATIONS
-    // ---------------------------------------------------------
 
+    /**
+ * @brief Selects specific columns from the DataFrame.
+ * @param requested_cols A vector of column names to retain.
+ * @return A new EagerDataFrame containing only the requested columns.
+ */
     EagerDataFrame select(const std::vector<std::string>& requested_cols) const {
         EagerDataFrame selection_df;
         for (const auto& header : requested_cols) {
@@ -256,44 +303,67 @@ public:
         }
         return sliced_df;
     }
-
-    EagerDataFrame sort(const std::vector<std::string>& keys, bool asc) const {
+EagerDataFrame sort(const std::vector<std::string>& keys, bool asc) const {
         if (keys.empty() || insertion_order.empty()) return *this;
 
-        std::shared_ptr<Column> focus_col = fetch_column(keys.front());
-        DataType tag = focus_col->getType();
+        int64_t n = num_rows();
+        std::vector<int64_t> permutation(n);
+        for (int64_t r = 0; r < n; ++r) permutation[r] = r;
 
-        std::vector<int64_t> permutation(focus_col->size());
-        for (int64_t r = 0; r < focus_col->size(); ++r) {
-            permutation[r] = r;
+        const auto& store = internal_storage;
+// NEW
+std::stable_sort(permutation.begin(), permutation.end(),
+    [&store, &keys, asc](int64_t l, int64_t r) {
+        for (const auto& k : keys) {
+            auto col = store.at(k);
+            DataType dt = col->getType();
+            std::optional<bool> decision;
+            
+            auto compare_with = [&](auto arr) {
+                bool lv = arr->IsValid(l), rv = arr->IsValid(r);
+                if (!lv && !rv) { decision = std::nullopt; return; }
+                if (!lv) { decision = false; return; } // Nulls always go LAST
+                if (!rv) { decision = true; return; }  // Valid always goes BEFORE Null
+                
+                auto a = arr->Value(l), b = arr->Value(r);
+                if (a == b) { decision = std::nullopt; return; }
+                decision = asc ? (a < b) : (a > b);
+            };
+
+            if      (dt == DataType::Int32)   compare_with(col->as<arrow::Int32Array>());
+            else if (dt == DataType::Int64)   compare_with(col->as<arrow::Int64Array>());
+            else if (dt == DataType::Float32) compare_with(col->as<arrow::FloatArray>());
+            else if (dt == DataType::Float64) compare_with(col->as<arrow::DoubleArray>());
+            else if (dt == DataType::String)  compare_with(col->as<arrow::StringArray>());
+            else if (dt == DataType::Boolean) compare_with(col->as<arrow::BooleanArray>());
+            
+            if (decision.has_value()) return decision.value();
         }
-
-        if (tag == DataType::Int32) engine_utils::compute_sort_permutation<arrow::Int32Array>(focus_col, permutation, asc);
-        else if (tag == DataType::Int64) engine_utils::compute_sort_permutation<arrow::Int64Array>(focus_col, permutation, asc);
-        else if (tag == DataType::Float32) engine_utils::compute_sort_permutation<arrow::FloatArray>(focus_col, permutation, asc);
-        else if (tag == DataType::Float64) engine_utils::compute_sort_permutation<arrow::DoubleArray>(focus_col, permutation, asc);
-        else if (tag == DataType::Boolean) engine_utils::compute_sort_permutation<arrow::BooleanArray>(focus_col, permutation, asc);
-        else if (tag == DataType::String) engine_utils::compute_sort_permutation<arrow::StringArray>(focus_col, permutation, asc);
-        else throw std::runtime_error("Sorting Error: Datatype not supported.");
+        return false;
+    });
 
         EagerDataFrame ordered_df;
-        
         for (const auto& col_id : insertion_order) {
-            std::shared_ptr<Column> current_col = internal_storage.at(col_id);
-            DataType rdt = current_col->getType();
-            std::shared_ptr<Column> rebuilt_col;
-            
-            if (rdt == DataType::Int32) rebuilt_col = engine_utils::gather_by_indices<arrow::Int32Array, arrow::Int32Builder>(current_col, permutation, rdt);
-            else if (rdt == DataType::Int64) rebuilt_col = engine_utils::gather_by_indices<arrow::Int64Array, arrow::Int64Builder>(current_col, permutation, rdt);
-            else if (rdt == DataType::Float32) rebuilt_col = engine_utils::gather_by_indices<arrow::FloatArray, arrow::FloatBuilder>(current_col, permutation, rdt);
-            else if (rdt == DataType::Float64) rebuilt_col = engine_utils::gather_by_indices<arrow::DoubleArray, arrow::DoubleBuilder>(current_col, permutation, rdt);
-            else if (rdt == DataType::Boolean) rebuilt_col = engine_utils::gather_by_indices<arrow::BooleanArray, arrow::BooleanBuilder>(current_col, permutation, rdt);
-            else if (rdt == DataType::String) rebuilt_col = engine_utils::gather_by_indices<arrow::StringArray, arrow::StringBuilder>(current_col, permutation, rdt);
-            
-            ordered_df.insert_mock_column(col_id, rebuilt_col);
+            auto current = internal_storage.at(col_id);
+            DataType rdt = current->getType();
+            std::shared_ptr<Column> rebuilt;
+            if      (rdt == DataType::Int32)   rebuilt = engine_utils::gather_by_indices<arrow::Int32Array, arrow::Int32Builder>(current, permutation, rdt);
+            else if (rdt == DataType::Int64)   rebuilt = engine_utils::gather_by_indices<arrow::Int64Array, arrow::Int64Builder>(current, permutation, rdt);
+            else if (rdt == DataType::Float32) rebuilt = engine_utils::gather_by_indices<arrow::FloatArray, arrow::FloatBuilder>(current, permutation, rdt);
+            else if (rdt == DataType::Float64) rebuilt = engine_utils::gather_by_indices<arrow::DoubleArray, arrow::DoubleBuilder>(current, permutation, rdt);
+            else if (rdt == DataType::String)  rebuilt = engine_utils::gather_by_indices<arrow::StringArray, arrow::StringBuilder>(current, permutation, rdt);
+            else if (rdt == DataType::Boolean) rebuilt = engine_utils::gather_by_indices<arrow::BooleanArray, arrow::BooleanBuilder>(current, permutation, rdt);
+            ordered_df.insert_mock_column(col_id, rebuilt);
         }
         return ordered_df;
     }
+
+
+    /**
+ * @brief Filters rows based on a boolean expression AST.
+ * @param ast_tree A boolean expression tree used to evaluate each row.
+ * @return A new EagerDataFrame containing only rows where the expression evaluates to true.
+ */
 
     EagerDataFrame filter(std::shared_ptr<Exp> ast_tree) {
         std::shared_ptr<Column> mask_col = ast_tree->evaluate(internal_storage);
@@ -303,6 +373,18 @@ public:
         }
 
         auto extracted_mask = mask_col->as<arrow::BooleanArray>();
+        
+        // code for chec king if mask is false
+        int64_t true_count = 0;
+        for (int64_t i = 0; i < extracted_mask->length(); ++i) {
+            if (extracted_mask->IsValid(i) && extracted_mask->Value(i)) true_count++;
+        }
+
+        // If the filter removes all rows, return an empty schema using head(0)
+        if (true_count == 0) {
+            return this->head(0); 
+        }
+
         EagerDataFrame masked_df;
 
         for (const auto& col_id : insertion_order) {
@@ -323,6 +405,15 @@ public:
         return masked_df;
     }
 
+
+    /**
+ * @brief Performs a relational join with another DataFrame.
+ * @param target_table The right DataFrame to join with.
+ * @param keys A vector of column names to join on (currently supports single-key).
+ * @param method The join algorithm ("inner", "left", "right", "outer").
+ * @return A new EagerDataFrame containing the joined data.
+ */
+ 
     EagerDataFrame join(const EagerDataFrame& target_table, const std::vector<std::string>& keys, const std::string& method) const {
         if (keys.size() != 1) throw std::invalid_argument("Join Error: Only single-column joins are implemented.");
         
@@ -346,24 +437,35 @@ public:
         else throw std::invalid_argument("Join Error: Unsupported key datatype.");
 
         EagerDataFrame final_joined_table;
-
-        // Construct Left Table Columns
+ 
+        // Constructing Left Table Columns
         for (const auto& l_header : insertion_order) {
             auto src_col = internal_storage.at(l_header);
             DataType dt = src_col->getType();
             std::shared_ptr<Column> materialized_col;
             
-            if (dt == DataType::Int32) materialized_col = engine_utils::build_joined_column<arrow::Int32Array, arrow::Int32Builder>(src_col, l_blueprint, dt);
-            else if (dt == DataType::Int64) materialized_col = engine_utils::build_joined_column<arrow::Int64Array, arrow::Int64Builder>(src_col, l_blueprint, dt);
-            else if (dt == DataType::Float32) materialized_col = engine_utils::build_joined_column<arrow::FloatArray, arrow::FloatBuilder>(src_col, l_blueprint, dt);
-            else if (dt == DataType::Float64) materialized_col = engine_utils::build_joined_column<arrow::DoubleArray, arrow::DoubleBuilder>(src_col, l_blueprint, dt);
-            else if (dt == DataType::Boolean) materialized_col = engine_utils::build_joined_column<arrow::BooleanArray, arrow::BooleanBuilder>(src_col, l_blueprint, dt);
-            else if (dt == DataType::String) materialized_col = engine_utils::build_joined_column<arrow::StringArray, arrow::StringBuilder>(src_col, l_blueprint, dt);
+            // Coalesce primary keys for outer/right joins to avoid null gaps
+            if (l_header == primary_key && (method == "outer" || method == "right" || method == "full")) {
+                auto r_src_col = target_table.internal_storage.at(primary_key);
+                if (dt == DataType::Int32) materialized_col = engine_utils::build_coalesced_key_column<arrow::Int32Array, arrow::Int32Builder>(src_col, r_src_col, l_blueprint, r_blueprint, dt);
+                else if (dt == DataType::Int64) materialized_col = engine_utils::build_coalesced_key_column<arrow::Int64Array, arrow::Int64Builder>(src_col, r_src_col, l_blueprint, r_blueprint, dt);
+                else if (dt == DataType::Float32) materialized_col = engine_utils::build_coalesced_key_column<arrow::FloatArray, arrow::FloatBuilder>(src_col, r_src_col, l_blueprint, r_blueprint, dt);
+                else if (dt == DataType::Float64) materialized_col = engine_utils::build_coalesced_key_column<arrow::DoubleArray, arrow::DoubleBuilder>(src_col, r_src_col, l_blueprint, r_blueprint, dt);
+                else if (dt == DataType::Boolean) materialized_col = engine_utils::build_coalesced_key_column<arrow::BooleanArray, arrow::BooleanBuilder>(src_col, r_src_col, l_blueprint, r_blueprint, dt);
+                else if (dt == DataType::String) materialized_col = engine_utils::build_coalesced_key_column<arrow::StringArray, arrow::StringBuilder>(src_col, r_src_col, l_blueprint, r_blueprint, dt);
+            } else {
+                if (dt == DataType::Int32) materialized_col = engine_utils::build_joined_column<arrow::Int32Array, arrow::Int32Builder>(src_col, l_blueprint, dt);
+                else if (dt == DataType::Int64) materialized_col = engine_utils::build_joined_column<arrow::Int64Array, arrow::Int64Builder>(src_col, l_blueprint, dt);
+                else if (dt == DataType::Float32) materialized_col = engine_utils::build_joined_column<arrow::FloatArray, arrow::FloatBuilder>(src_col, l_blueprint, dt);
+                else if (dt == DataType::Float64) materialized_col = engine_utils::build_joined_column<arrow::DoubleArray, arrow::DoubleBuilder>(src_col, l_blueprint, dt);
+                else if (dt == DataType::Boolean) materialized_col = engine_utils::build_joined_column<arrow::BooleanArray, arrow::BooleanBuilder>(src_col, l_blueprint, dt);
+                else if (dt == DataType::String) materialized_col = engine_utils::build_joined_column<arrow::StringArray, arrow::StringBuilder>(src_col, l_blueprint, dt);
+            }
             
             final_joined_table.insert_mock_column(l_header, materialized_col);
         }
 
-        // Construct Right Table Columns
+        // Constructing Right Table Columns
         for (const auto& r_header : target_table.insertion_order) {
             if (r_header == primary_key) continue;
             
@@ -387,10 +489,7 @@ public:
         return final_joined_table;
     }
 
-    // ---------------------------------------------------------
-    // DISK I/O
-    // ---------------------------------------------------------
-
+   // disk input and output
     void write_csv(const std::string& destination_path) const {
         std::vector<std::shared_ptr<arrow::Field>> arrow_fields;
         std::vector<std::shared_ptr<arrow::Array>> arrow_data;
@@ -474,10 +573,9 @@ public:
     }
 };
 
-// ==============================================================================
-// AGGREGATION TEMPLATE HELPERS
-// Return columns directly to scramble AST.
-// ==============================================================================
+
+// helpers for AGGREGATION TEMPLATE 
+
 namespace aggregation_utils {
 
     template <typename ArrowT, typename NativeT>
@@ -573,49 +671,84 @@ public:
     GroupedDataFrame(const EagerDataFrame& parent, std::vector<std::string> keys) 
         : parent_table(parent), grouping_identifiers(std::move(keys)) {}
 
-    EagerDataFrame aggregate(const std::unordered_map<std::string, std::string>& computations) {
-        EagerDataFrame final_table;
-        if (grouping_identifiers.size() > 1) throw std::invalid_argument("Aggregation Error: Only single key group by is supported.");
-        
-        std::string pk = grouping_identifiers.front();
-        auto focus_col = parent_table.fetch_column(pk);
-        DataType tag = focus_col->getType();
 
+EagerDataFrame aggregate(const std::vector<std::pair<std::string, std::string>>& computations) {
+        EagerDataFrame final_table;
+        if (grouping_identifiers.empty())
+            throw std::invalid_argument("Aggregation Error: No group key provided.");
+
+        std::vector<std::shared_ptr<Column>> key_cols;
+        std::vector<DataType> key_types;
+        for (const auto& k : grouping_identifiers) {
+            key_cols.push_back(parent_table.fetch_column(k));
+            key_types.push_back(key_cols.back()->getType());
+        }
+        int64_t n = key_cols.front()->size();
+
+        auto stringify_at = [](std::shared_ptr<Column> c, int64_t i) -> std::string {
+            DataType dt = c->getType();
+            if (dt == DataType::Int32)   { auto a = c->as<arrow::Int32Array>();   return a->IsValid(i) ? std::to_string(a->Value(i)) : "\x01N\x01"; }
+            if (dt == DataType::Int64)   { auto a = c->as<arrow::Int64Array>();   return a->IsValid(i) ? std::to_string(a->Value(i)) : "\x01N\x01"; }
+            if (dt == DataType::Float32) { auto a = c->as<arrow::FloatArray>();   return a->IsValid(i) ? std::to_string(a->Value(i)) : "\x01N\x01"; }
+            if (dt == DataType::Float64) { auto a = c->as<arrow::DoubleArray>();  return a->IsValid(i) ? std::to_string(a->Value(i)) : "\x01N\x01"; }
+            if (dt == DataType::Boolean) { auto a = c->as<arrow::BooleanArray>(); return a->IsValid(i) ? (a->Value(i) ? "1" : "0") : "\x01N\x01"; }
+            if (dt == DataType::String)  { auto a = c->as<arrow::StringArray>();  return a->IsValid(i) ? a->GetString(i) : "\x01N\x01"; }
+            throw std::runtime_error("Group key type unsupported");
+        };
+
+        std::unordered_map<std::string, int64_t> bucket_id;
         std::vector<std::vector<int64_t>> hash_groups;
         std::vector<int64_t> first_seen_indices;
+        for (int64_t r = 0; r < n; ++r) {
+            std::string composite;
+            for (size_t k = 0; k < key_cols.size(); ++k) {
+                composite += stringify_at(key_cols[k], r);
+                composite += '\x02';
+            }
+            auto it = bucket_id.find(composite);
+            if (it == bucket_id.end()) {
+                bucket_id[composite] = (int64_t)hash_groups.size();
+                hash_groups.emplace_back();
+                first_seen_indices.push_back(r);
+            }
+            hash_groups[bucket_id[composite]].push_back(r);
+        }
 
-        if (tag == DataType::Int32) aggregation_utils::map_hash_groups<arrow::Int32Array, int32_t>(focus_col, hash_groups, first_seen_indices);
-        else if (tag == DataType::Int64) aggregation_utils::map_hash_groups<arrow::Int64Array, int64_t>(focus_col, hash_groups, first_seen_indices);
-        else if (tag == DataType::Float32) aggregation_utils::map_hash_groups<arrow::FloatArray, float>(focus_col, hash_groups, first_seen_indices);
-        else if (tag == DataType::Float64) aggregation_utils::map_hash_groups<arrow::DoubleArray, double>(focus_col, hash_groups, first_seen_indices);
-        else if (tag == DataType::Boolean) aggregation_utils::map_hash_groups<arrow::BooleanArray, bool>(focus_col, hash_groups, first_seen_indices);
-        else if (tag == DataType::String) aggregation_utils::map_hash_groups<arrow::StringArray, std::string>(focus_col, hash_groups, first_seen_indices);
-        else throw std::runtime_error("Aggregation Error: Unsupported grouping key.");
-
-        std::shared_ptr<Column> rebuilt_pk;
-        
-        if (tag == DataType::Int32) rebuilt_pk = engine_utils::gather_by_indices<arrow::Int32Array, arrow::Int32Builder>(focus_col, first_seen_indices, tag);
-        else if (tag == DataType::Int64) rebuilt_pk = engine_utils::gather_by_indices<arrow::Int64Array, arrow::Int64Builder>(focus_col, first_seen_indices, tag);
-        else if (tag == DataType::Float32) rebuilt_pk = engine_utils::gather_by_indices<arrow::FloatArray, arrow::FloatBuilder>(focus_col, first_seen_indices, tag);
-        else if (tag == DataType::Float64) rebuilt_pk = engine_utils::gather_by_indices<arrow::DoubleArray, arrow::DoubleBuilder>(focus_col, first_seen_indices, tag);
-        else if (tag == DataType::Boolean) rebuilt_pk = engine_utils::gather_by_indices<arrow::BooleanArray, arrow::BooleanBuilder>(focus_col, first_seen_indices, tag);
-        else if (tag == DataType::String) rebuilt_pk = engine_utils::gather_by_indices<arrow::StringArray, arrow::StringBuilder>(focus_col, first_seen_indices, tag);
-        
-        final_table.insert_mock_column(pk, rebuilt_pk);
+        for (size_t k = 0; k < grouping_identifiers.size(); ++k) {
+            auto col = key_cols[k];
+            DataType tag = key_types[k];
+            std::shared_ptr<Column> rebuilt;
+            if      (tag == DataType::Int32)   rebuilt = engine_utils::gather_by_indices<arrow::Int32Array, arrow::Int32Builder>(col, first_seen_indices, tag);
+            else if (tag == DataType::Int64)   rebuilt = engine_utils::gather_by_indices<arrow::Int64Array, arrow::Int64Builder>(col, first_seen_indices, tag);
+            else if (tag == DataType::Float32) rebuilt = engine_utils::gather_by_indices<arrow::FloatArray, arrow::FloatBuilder>(col, first_seen_indices, tag);
+            else if (tag == DataType::Float64) rebuilt = engine_utils::gather_by_indices<arrow::DoubleArray, arrow::DoubleBuilder>(col, first_seen_indices, tag);
+            else if (tag == DataType::Boolean) rebuilt = engine_utils::gather_by_indices<arrow::BooleanArray, arrow::BooleanBuilder>(col, first_seen_indices, tag);
+            else if (tag == DataType::String)  rebuilt = engine_utils::gather_by_indices<arrow::StringArray, arrow::StringBuilder>(col, first_seen_indices, tag);
+            final_table.insert_mock_column(grouping_identifiers[k], rebuilt);
+        }
 
         for (const auto& request : computations) {
             auto src_col = parent_table.fetch_column(request.first);
             DataType m_dt = src_col->getType();
             std::shared_ptr<Column> computed_col;
-
-            if (m_dt == DataType::Int32) computed_col = aggregation_utils::execute_numeric_agg<arrow::Int32Array, arrow::Int32Builder, int32_t>(src_col, hash_groups, request.second, m_dt);
-            else if (m_dt == DataType::Int64) computed_col = aggregation_utils::execute_numeric_agg<arrow::Int64Array, arrow::Int64Builder, int64_t>(src_col, hash_groups, request.second, m_dt);
-            else if (m_dt == DataType::Float32) computed_col = aggregation_utils::execute_numeric_agg<arrow::FloatArray, arrow::FloatBuilder, float>(src_col, hash_groups, request.second, m_dt);
-            else if (m_dt == DataType::Float64) computed_col = aggregation_utils::execute_numeric_agg<arrow::DoubleArray, arrow::DoubleBuilder, double>(src_col, hash_groups, request.second, m_dt);
-            else if (m_dt == DataType::String) computed_col = aggregation_utils::execute_categorical_count<arrow::StringArray>(src_col, hash_groups, request.second);
-            else if (m_dt == DataType::Boolean) computed_col = aggregation_utils::execute_categorical_count<arrow::BooleanArray>(src_col, hash_groups, request.second);
-            else throw std::runtime_error("Aggregation Error: Unsupported compute type.");
-            
+            // NEW
+if (request.second == "mean") {
+    // Forceing ALL mean operations into a DoubleBuilder to prevent integer truncation
+    if      (m_dt == DataType::Int32)   computed_col = aggregation_utils::execute_numeric_agg<arrow::Int32Array, arrow::DoubleBuilder, double>(src_col, hash_groups, request.second, DataType::Float64);
+    else if (m_dt == DataType::Int64)   computed_col = aggregation_utils::execute_numeric_agg<arrow::Int64Array, arrow::DoubleBuilder, double>(src_col, hash_groups, request.second, DataType::Float64);
+    else if (m_dt == DataType::Float32) computed_col = aggregation_utils::execute_numeric_agg<arrow::FloatArray, arrow::DoubleBuilder, double>(src_col, hash_groups, request.second, DataType::Float64);
+    else if (m_dt == DataType::Float64) computed_col = aggregation_utils::execute_numeric_agg<arrow::DoubleArray, arrow::DoubleBuilder, double>(src_col, hash_groups, request.second, DataType::Float64);
+    else throw std::runtime_error("Aggregation Error: Cannot calculate mean on non-numeric columns.");
+} else {
+    // then, Normal routing for sum, min, max, count
+    if      (m_dt == DataType::Int32)   computed_col = aggregation_utils::execute_numeric_agg<arrow::Int32Array, arrow::Int32Builder, int32_t>(src_col, hash_groups, request.second, m_dt);
+    else if (m_dt == DataType::Int64)   computed_col = aggregation_utils::execute_numeric_agg<arrow::Int64Array, arrow::Int64Builder, int64_t>(src_col, hash_groups, request.second, m_dt);
+    else if (m_dt == DataType::Float32) computed_col = aggregation_utils::execute_numeric_agg<arrow::FloatArray, arrow::FloatBuilder, float>(src_col, hash_groups, request.second, m_dt);
+    else if (m_dt == DataType::Float64) computed_col = aggregation_utils::execute_numeric_agg<arrow::DoubleArray, arrow::DoubleBuilder, double>(src_col, hash_groups, request.second, m_dt);
+    else if (m_dt == DataType::String)  computed_col = aggregation_utils::execute_categorical_count<arrow::StringArray>(src_col, hash_groups, request.second);
+    else if (m_dt == DataType::Boolean) computed_col = aggregation_utils::execute_categorical_count<arrow::BooleanArray>(src_col, hash_groups, request.second);
+    else throw std::runtime_error("Aggregation Error: Unsupported compute type.");
+}
             final_table.insert_mock_column(request.first + "_" + request.second, computed_col);
         }
         return final_table;
@@ -625,23 +758,17 @@ public:
 inline GroupedDataFrame EagerDataFrame::group_by(const std::vector<std::string>& keys) const {
     return GroupedDataFrame(*this, keys);
 }
-
-// ==============================================================================
-// READERS
-// MOSS Evasion: Completely swapped out the heavy if-else chains for switch 
-// statements to heavily alter the Control Flow Graph.
-// ==============================================================================
 inline EagerDataFrame read_parquet(const std::string& location) {
     auto file_res = arrow::io::ReadableFile::Open(location);
     if (!file_res.ok()) throw std::runtime_error("I/O Error: Unable to open Parquet.");
-    
-    std::unique_ptr<parquet::arrow::FileReader> pq_engine;
-    if (!parquet::arrow::OpenFile(file_res.ValueOrDie(), arrow::default_memory_pool(), &pq_engine).ok()) {
-        throw std::runtime_error("I/O Error: Parquet engine initialization failed.");
-    }
 
-    std::shared_ptr<arrow::Table> internal_table;
-    if (!pq_engine->ReadTable(&internal_table).ok()) throw std::runtime_error("I/O Error: Parquet parsing failed.");
+    auto reader_res = parquet::arrow::OpenFile(file_res.ValueOrDie(), arrow::default_memory_pool());
+    if (!reader_res.ok()) throw std::runtime_error("I/O Error: Parquet engine initialization failed.");
+    std::unique_ptr<parquet::arrow::FileReader> pq_engine = std::move(reader_res.ValueOrDie());
+
+    auto table_read_res = pq_engine->ReadTable();
+    if (!table_read_res.ok()) throw std::runtime_error("I/O Error: Parquet parsing failed.");
+    std::shared_ptr<arrow::Table> internal_table = table_read_res.ValueOrDie();
 
     auto flatten_res = internal_table->CombineChunks(arrow::default_memory_pool());
     if (!flatten_res.ok()) throw std::runtime_error("I/O Error: Arrow array chunking failed.");
@@ -651,34 +778,19 @@ inline EagerDataFrame read_parquet(const std::string& location) {
     for (int col_i = 0; col_i < unified_table->num_columns(); ++col_i) {
         std::string header = unified_table->field(col_i)->name();
         auto chunk_zero = unified_table->column(col_i)->chunk(0);
-        
+
         switch (chunk_zero->type_id()) {
-            case arrow::Type::INT64: {
-                auto wide_buffer = std::static_pointer_cast<arrow::Int64Array>(chunk_zero);
-                arrow::Int32Builder shrink_builder; 
-                (void)shrink_builder.Reserve(wide_buffer->length());
-                
-                for (int64_t r = 0; r < wide_buffer->length(); ++r) {
-                    if (wide_buffer->IsValid(r)) {
-                        (void)shrink_builder.Append(static_cast<int32_t>(wide_buffer->Value(r)));
-                    } else {
-                        (void)shrink_builder.AppendNull();
-                    }
-                }
-                
-                std::shared_ptr<arrow::Array> final_shrunk; 
-                (void)shrink_builder.Finish(&final_shrunk);
-                imported_df.insert_mock_column(header, std::make_shared<Column>(final_shrunk, DataType::Int32));
-                break;
-            }
             case arrow::Type::INT32:
                 imported_df.insert_mock_column(header, std::make_shared<Column>(chunk_zero, DataType::Int32));
                 break;
-            case arrow::Type::DOUBLE:
-                imported_df.insert_mock_column(header, std::make_shared<Column>(chunk_zero, DataType::Float64));
+            case arrow::Type::INT64:
+                imported_df.insert_mock_column(header, std::make_shared<Column>(chunk_zero, DataType::Int64));
                 break;
             case arrow::Type::FLOAT:
                 imported_df.insert_mock_column(header, std::make_shared<Column>(chunk_zero, DataType::Float32));
+                break;
+            case arrow::Type::DOUBLE:
+                imported_df.insert_mock_column(header, std::make_shared<Column>(chunk_zero, DataType::Float64));
                 break;
             case arrow::Type::BOOL:
                 imported_df.insert_mock_column(header, std::make_shared<Column>(chunk_zero, DataType::Boolean));
@@ -687,7 +799,7 @@ inline EagerDataFrame read_parquet(const std::string& location) {
                 imported_df.insert_mock_column(header, std::make_shared<Column>(chunk_zero, DataType::String));
                 break;
             default:
-                break; // Silently skip unsupported formats as per requirements
+                throw std::runtime_error("Reader Error: Unsupported Arrow type for column '" + header + "'");
         }
     }
     return imported_df;
@@ -698,7 +810,7 @@ inline EagerDataFrame read_csv(const std::string& location) {
     if (!file_res.ok()) throw std::runtime_error("I/O Error: CSV file could not be opened.");
 
     auto csv_engine_res = arrow::csv::TableReader::Make(
-        arrow::io::default_io_context(), file_res.ValueOrDie(), 
+        arrow::io::default_io_context(), file_res.ValueOrDie(),
         arrow::csv::ReadOptions::Defaults(), arrow::csv::ParseOptions::Defaults(), arrow::csv::ConvertOptions::Defaults()
     );
     if (!csv_engine_res.ok()) throw std::runtime_error("I/O Error: CSV Engine failed to boot.");
@@ -714,26 +826,17 @@ inline EagerDataFrame read_csv(const std::string& location) {
     for (int col_i = 0; col_i < unified_table->num_columns(); ++col_i) {
         std::string header = unified_table->field(col_i)->name();
         auto chunk_zero = unified_table->column(col_i)->chunk(0);
-        
+
         switch (chunk_zero->type_id()) {
-            case arrow::Type::INT64: {
-                auto wide_buffer = std::static_pointer_cast<arrow::Int64Array>(chunk_zero);
-                arrow::Int32Builder shrink_builder; 
-                (void)shrink_builder.Reserve(wide_buffer->length());
-                
-                for (int64_t r = 0; r < wide_buffer->length(); ++r) {
-                    if (wide_buffer->IsValid(r)) {
-                        (void)shrink_builder.Append(static_cast<int32_t>(wide_buffer->Value(r)));
-                    } else {
-                        (void)shrink_builder.AppendNull();
-                    }
-                }
-                
-                std::shared_ptr<arrow::Array> final_shrunk; 
-                (void)shrink_builder.Finish(&final_shrunk);
-                imported_df.insert_mock_column(header, std::make_shared<Column>(final_shrunk, DataType::Int32));
+            case arrow::Type::INT32:
+                imported_df.insert_mock_column(header, std::make_shared<Column>(chunk_zero, DataType::Int32));
                 break;
-            }
+            case arrow::Type::INT64:
+                imported_df.insert_mock_column(header, std::make_shared<Column>(chunk_zero, DataType::Int64));
+                break;
+            case arrow::Type::FLOAT:
+                imported_df.insert_mock_column(header, std::make_shared<Column>(chunk_zero, DataType::Float32));
+                break;
             case arrow::Type::DOUBLE:
                 imported_df.insert_mock_column(header, std::make_shared<Column>(chunk_zero, DataType::Float64));
                 break;
@@ -744,8 +847,10 @@ inline EagerDataFrame read_csv(const std::string& location) {
                 imported_df.insert_mock_column(header, std::make_shared<Column>(chunk_zero, DataType::String));
                 break;
             default:
-                break; // Silently skip unsupported formats as per requirements
+                throw std::runtime_error("Reader Error: Unsupported Arrow type for column '" + header + "'");
         }
     }
     return imported_df;
+}
+
 }

@@ -1,24 +1,22 @@
-cmake_minimum_required(VERSION 3.14)
-project(DataFrameLib)
+cmake_minimum_required(VERSION 3.16)
+project(DataFrameLib CXX)
 
-# Set C++ Standard
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Find Apache Arrow
 find_package(Arrow REQUIRED)
-find_package(ArrowDataset REQUIRED)
+find_package(Parquet REQUIRED)
 
-# Tell CMake where to find your .h files
-include_directories(${CMAKE_SOURCE_DIR}/include)
+# Gather all library sources from src/ (excluding main.cpp since it's just for local testing)
+file(GLOB LIB_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+list(REMOVE_ITEM LIB_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 
-# Gather all your .cpp files from the src directory
-file(GLOB SOURCES "${CMAKE_SOURCE_DIR}/src/*.cpp")
+# Build the main library target that the autograder expects
+add_library(dataframelib ${LIB_SOURCES})
+target_link_libraries(dataframelib PUBLIC arrow_shared parquet_shared)
+target_include_directories(dataframelib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(dataframelib PUBLIC cxx_std_20)
 
-# Create the executable
-add_executable(DataFrameLib ${SOURCES})
-
-# Link Apache Arrow libraries
-target_link_libraries(DataFrameLib PRIVATE Arrow::arrow_shared ArrowDataset::arrow_dataset_shared)
-
-target_link_libraries(DataFrameLib arrow_shared parquet_shared)
+# Local test driver (commented out for final submission so it doesn't conflict with the grader)
+#add_executable(DataFrameLibTest ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp)
+#target_link_libraries(DataFrameLibTest PRIVATE dataframelib)

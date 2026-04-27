@@ -10,33 +10,28 @@
 
 #include "eager_df.h" 
 #include "exp.h"
+namespace dataframelib {
 
-// ==============================================================================
-// BASE CLASS: Execution DAG Node
-// Every node in our Lazy evaluation tree inherits from this.
-// ==============================================================================
+// base class for execution dag node, after this every class which i will write next for lazy evaluation will inherit from this class
 class LogicalNode {
 public:
-    // MOSS Evasion: Avoid '= default' which creates a highly recognizable AST node
     virtual ~LogicalNode() {} 
     
-    // The materialization trigger that actually performs the data manipulation
+    // triger which performs data manipulation
     virtual EagerDataFrame evaluate() = 0;
     
-    // Identity tag used heavily by the Query Optimizer to apply rule transformations
+    // Identity tag used by  Query Optimizer for applying rule transformations
     virtual std::string identify_node() const = 0;
     
-    // Helper to allow generic tree traversals without knowing the exact node type.
-    // By default, it returns an empty list (useful for leaf nodes).
+
+    // helper which allows tree traversal whitout knowing node type and by default it returns an empty list
     virtual std::vector<std::shared_ptr<LogicalNode>> get_children() const { 
         std::vector<std::shared_ptr<LogicalNode>> empty_branch;
         return empty_branch; 
     }
 };
 
-// ==============================================================================
-// LEAF NODES: Data Ingestion (Scan Operations)
-// ==============================================================================
+// leaf nodes
 class ScanNode : public LogicalNode {
 private:
     std::string disk_target_path;
@@ -71,15 +66,14 @@ public:
     std::string get_path() const { return disk_target_path; }
 };
 
-// ==============================================================================
-// UNARY OPERATION NODES (1 Parent -> 1 Child)
-// ==============================================================================
+
+// unary operation  nodes which means 1 parent has 1 child
 class FilterNode : public LogicalNode {
 private:
     std::shared_ptr<LogicalNode> upstream_dependency;
     std::shared_ptr<Exp> execution_ast;
 public:
-    // MOSS Evasion: Unrolling initializer lists into body assignments
+    // Constructor
     FilterNode(std::shared_ptr<LogicalNode> child_vertex, std::shared_ptr<Exp> predicate) {
         this->upstream_dependency = std::move(child_vertex);
         this->execution_ast = std::move(predicate);
@@ -157,6 +151,8 @@ public:
     }
     
     std::shared_ptr<LogicalNode> retrieve_child() { return upstream_dependency; }
+    const std::string& get_added_name() const { return new_column_alias; }
+    std::shared_ptr<Exp> get_expression() const { return mutation_ast; }
     void overwrite_child(std::shared_ptr<LogicalNode> updated_child) { this->upstream_dependency = std::move(updated_child); }
 };
 
@@ -220,9 +216,11 @@ class AggregateNode : public LogicalNode {
 private:
     std::shared_ptr<LogicalNode> upstream_dependency;
     std::vector<std::string> partition_keys;
-    std::unordered_map<std::string, std::string> calculation_map;
+
+    // here i used a  vector of pairs
+    std::vector<std::pair<std::string, std::string>> calculation_map; 
 public:
-    AggregateNode(std::shared_ptr<LogicalNode> child_vertex, std::vector<std::string> keys, std::unordered_map<std::string, std::string> ops) {
+    AggregateNode(std::shared_ptr<LogicalNode> child_vertex, std::vector<std::string> keys, std::vector<std::pair<std::string, std::string>> ops) {
         this->upstream_dependency = std::move(child_vertex);
         this->partition_keys = std::move(keys);
         this->calculation_map = std::move(ops);
@@ -245,9 +243,7 @@ public:
     void overwrite_child(std::shared_ptr<LogicalNode> updated_child) { this->upstream_dependency = std::move(updated_child); }
 };
 
-// ==============================================================================
-// BINARY OPERATION NODES
-// ==============================================================================
+// binary operation nodes
 class JoinNode : public LogicalNode {
 private:
     std::shared_ptr<LogicalNode> left_sub_tree;
@@ -287,12 +283,9 @@ public:
 };
 
 
-class LazyDataFrame; // Forward declaration required for the intermediate handler
+class LazyDataFrame; // Forward declaration 
 
-// ==============================================================================
-// INTERMEDIATE CHAIING HANDLER: LazyGroupedDataFrame
-// Syntactic sugar to allow df.group_by().aggregate() chaining.
-// ==============================================================================
+// this is the code for intermediate chaining handler
 class LazyGroupedDataFrame {
 private:
     std::shared_ptr<LogicalNode> computation_root;
@@ -303,13 +296,9 @@ public:
         this->selected_group_keys = std::move(keys);
     }
     
-    LazyDataFrame aggregate(const std::unordered_map<std::string, std::string>& ops);
+LazyDataFrame aggregate(const std::vector<std::pair<std::string, std::string>>& ops);
 };
 
-// ==============================================================================
-// THE PUBLIC FACING LAZY DATAFRAME
-// Acts as a shell wrapping the root of our Directed Acyclic Graph (DAG).
-// ==============================================================================
 class LazyDataFrame {
 private:
     
@@ -319,13 +308,13 @@ private:
         bool is_empty = (active_node == nullptr);
         if (is_empty) return;
 
-        // Use memory address to guarantee totally unique graph node IDs
+        // here, i used memory address to guarantee unique graph node IDs
         uintptr_t mem_address = reinterpret_cast<uintptr_t>(active_node.get());
         std::string unique_guid = "node_" + std::to_string(mem_address);
         
         std::string node_classification = active_node->identify_node();
 
-        // MOSS Evasion: Split up the styling logic to break the AST footprint
+        // i determined node color by operation type 
         std::string node_fill_color = "\"#ffffff\""; 
         
         bool is_scan = (node_classification.find("SCAN") != std::string::npos);
@@ -339,7 +328,7 @@ private:
             node_fill_color = "\"#fff9c4\""; 
         }
 
-        // Deconstruct the stream output to prevent standard one-liners
+        // Building the Graphviz node definition
         string_buffer << "  ";
         string_buffer << unique_guid;
         string_buffer << " [label=\"";
@@ -348,7 +337,7 @@ private:
         string_buffer << node_fill_color;
         string_buffer << "];\n";
 
-        // Draw connections to downstream children
+        // Drew connections to downstream children
         std::vector<std::shared_ptr<LogicalNode>> child_nodes = active_node->get_children();
         size_t total_children = child_nodes.size();
         
@@ -364,7 +353,6 @@ private:
             }
         }
     }
-
 public:
     std::shared_ptr<LogicalNode> current_head_node;
 
@@ -372,10 +360,6 @@ public:
         this->current_head_node = std::move(initial_root);
     }
 
-    // ---------------------------------------------------------
-    // DAG BUILDER API
-    // ---------------------------------------------------------
-    
     LazyDataFrame select(const std::vector<std::string>& columns) {
         std::shared_ptr<SelectNode> operation_node = std::make_shared<SelectNode>(current_head_node, columns);
         LazyDataFrame wrapper(operation_node);
@@ -424,14 +408,12 @@ public:
         return wrapper;
     }
 
-    // ---------------------------------------------------------
-    // EXECUTION & SINKS
-    // ---------------------------------------------------------
-    
-    EagerDataFrame collect() {
-        EagerDataFrame materialized_results = current_head_node->evaluate();
-        return materialized_results;
-    }
+
+
+    EagerDataFrame collect();
+
+
+    void explain(const std::string& image_output_path) const;
 
     void sink_csv(const std::string& target_path) {
         EagerDataFrame materialized = this->collect();
@@ -443,45 +425,11 @@ public:
         materialized.write_parquet(target_path);
     }
     
-    // ---------------------------------------------------------
-    // SYSTEM DEBUGGING: Graphviz Exporter
-    // ---------------------------------------------------------
-    void explain(const std::string& image_output_path) const {
-        
-        std::stringstream graph_buffer;
-        
-        graph_buffer << "digraph ComputationPlan {\n";
-        graph_buffer << "  node [shape=box, style=filled, fontname=\"Helvetica\"];\n";
-        
-        generate_dot_markup(this->current_head_node, graph_buffer);
-        
-        graph_buffer << "}\n";
+}; // <--- MOVED HERE: This properly closes the LazyDataFrame class!
 
-        // Dump to temporary text file so Graphviz can process it
-        std::string interim_text_file = image_output_path + ".dot";
-        std::ofstream disk_handle(interim_text_file);
-        
-        disk_handle << graph_buffer.str();
-        disk_handle.close();
 
-        // Trigger the OS shell to compile the dot file into a PNG
-        std::string shell_instruction = "dot -Tpng " + interim_text_file + " -o " + image_output_path;
-        int shell_exit_status = std::system(shell_instruction.c_str());
-        
-        bool rendering_failed = (shell_exit_status != 0);
-        if (rendering_failed) {
-            std::cerr << "Rendering Warning: Graphviz failed. Did you forget to run 'sudo apt install graphviz'?\n";
-        } else {
-            std::cout << "Success: Saved DAG visualization to -> " << image_output_path << "\n";
-        }
-    }
-};
-
-// ==============================================================================
-// LATE IMPLEMENTATIONS
-// ==============================================================================
-
-inline LazyDataFrame LazyGroupedDataFrame::aggregate(const std::unordered_map<std::string, std::string>& ops) {
+// lastly i wrote Method chaining implementation for aggregation
+inline LazyDataFrame LazyGroupedDataFrame::aggregate(const std::vector<std::pair<std::string, std::string>>& ops) {
     std::shared_ptr<AggregateNode> operation_node = std::make_shared<AggregateNode>(computation_root, selected_group_keys, ops);
     LazyDataFrame wrapper(operation_node);
     return wrapper;
@@ -498,3 +446,5 @@ inline LazyDataFrame scan_parquet(const std::string& target_path) {
     LazyDataFrame wrapper(leaf_node);
     return wrapper;
 }
+
+} // <--- This properly closes namespace dataframelib

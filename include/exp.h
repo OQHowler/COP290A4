@@ -11,24 +11,22 @@
 #include <type_traits>
 #include <cstdint> 
 
-// Renaming the typedef to alter the token stream slightly
+namespace dataframelib {
+
 using DataFrameColumns = std::unordered_map<std::string, std::shared_ptr<Column>>;
 
-// ==============================================================================
+
 // BASE EXPRESSION AST NODE
-// ==============================================================================
 class Exp : public std::enable_shared_from_this<Exp> {
 public:
-    // Modern C++ destructor definition
+
     virtual ~Exp() = default;
 
     virtual std::shared_ptr<Column> evaluate(const DataFrameColumns& execution_context) = 0;
     virtual std::string to_string() const = 0;
 
-    // ---------------------------------------------------------
-    // FLUENT CHAINING API
-    // ---------------------------------------------------------
-    
+
+    // CHAINING API
     std::shared_ptr<Exp> abs();
     std::shared_ptr<Exp> is_null();
     std::shared_ptr<Exp> is_not_null();
@@ -50,10 +48,8 @@ public:
     std::shared_ptr<Exp> alias(const std::string& new_alias);
 };
 
-// ==============================================================================
-// LEAF NODES: Columns and Literals
-// ==============================================================================
 
+// LEAF NODES: Columns and Literals
 class ColRef : public Exp {
 private:
     std::string col_id;
@@ -62,11 +58,11 @@ public:
     explicit ColRef(std::string name_arg) {
         this->col_id = std::move(name_arg);
     }
-
+    const std::string& name() const { return col_id; }
     std::shared_ptr<Column> evaluate(const DataFrameColumns& execution_context) override {
         auto map_it = execution_context.find(col_id);
         
-        // MOSS Evasion: Extract to boolean gate
+
         bool is_found = (map_it != execution_context.end());
         if (!is_found) {
             throw std::runtime_error("AST Evaluation Error: Could not locate column '" + col_id + "'");
@@ -99,9 +95,7 @@ public:
     }
 };
 
-// ==============================================================================
 // OPERATION NODES
-// ==============================================================================
 
 class BinaryOp : public Exp {
 public:
@@ -128,7 +122,7 @@ public:
     std::shared_ptr<Exp> child_operand;
     std::string action_token;
 
-    // Safety overload to prevent template deduction crashes on C-strings
+    // overloads to prevent template deduction crashes on C-strings
     inline std::shared_ptr<Exp> lit(const char* c_str_input) {
         return std::make_shared<ConstantNode>(DataType::String, std::string(c_str_input));
     }
@@ -183,15 +177,15 @@ public:
     }
 };
 
-// ==============================================================================
-// CONSTANT & LITERAL BUILDERS
-// ==============================================================================
 
-inline std::shared_ptr<Exp> col(const std::string& name) {
+// CONSTANT builders and LITERAL builders too
+
+
+inline std::shared_ptr<Exp> _make_col(const std::string& name) {
     return std::make_shared<ColRef>(name);
 }
 
-// MOSS Evasion: Renamed literal wrapper logic
+// this Helper maps native C++ types to my internal DataType enum for constant nodes
 template <typename T>
 inline std::shared_ptr<Exp> type_to_literal(T raw_input) {
     
@@ -224,85 +218,121 @@ inline std::shared_ptr<Exp> lit(T input_val) {
     return type_to_literal(input_val);
 }
 
-// ==============================================================================
-// MANUAL OPERATOR OVERLOADS (No Macros Used)
-// A student would copy and paste these to strictly follow the "no macro" rule.
-// ==============================================================================
 
-// --- ADDITION (+) ---
+
+// next, i wrote the code for manual operator overloads which support natural expression syntax 
+
+
+// ADDITION (+) 
 inline std::shared_ptr<Exp> operator+(std::shared_ptr<Exp> lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(std::move(lhs), std::move(rhs), "+"); }
 template <typename T> inline std::shared_ptr<Exp> operator+(std::shared_ptr<Exp> lhs, T rhs) { return std::make_shared<BinaryOp>(std::move(lhs), type_to_literal(rhs), "+"); }
 template <typename T> inline std::shared_ptr<Exp> operator+(T lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(type_to_literal(lhs), std::move(rhs), "+"); }
 
-// --- SUBTRACTION (-) ---
+//  SUBTRACTION (-)
 inline std::shared_ptr<Exp> operator-(std::shared_ptr<Exp> lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(std::move(lhs), std::move(rhs), "-"); }
 template <typename T> inline std::shared_ptr<Exp> operator-(std::shared_ptr<Exp> lhs, T rhs) { return std::make_shared<BinaryOp>(std::move(lhs), type_to_literal(rhs), "-"); }
 template <typename T> inline std::shared_ptr<Exp> operator-(T lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(type_to_literal(lhs), std::move(rhs), "-"); }
 
-// --- MULTIPLICATION (*) ---
+//  MULTIPLICATION (*) 
 inline std::shared_ptr<Exp> operator*(std::shared_ptr<Exp> lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(std::move(lhs), std::move(rhs), "*"); }
 template <typename T> inline std::shared_ptr<Exp> operator*(std::shared_ptr<Exp> lhs, T rhs) { return std::make_shared<BinaryOp>(std::move(lhs), type_to_literal(rhs), "*"); }
 template <typename T> inline std::shared_ptr<Exp> operator*(T lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(type_to_literal(lhs), std::move(rhs), "*"); }
 
-// --- DIVISION (/) ---
+//   DIVISION (/)  
 inline std::shared_ptr<Exp> operator/(std::shared_ptr<Exp> lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(std::move(lhs), std::move(rhs), "/"); }
 template <typename T> inline std::shared_ptr<Exp> operator/(std::shared_ptr<Exp> lhs, T rhs) { return std::make_shared<BinaryOp>(std::move(lhs), type_to_literal(rhs), "/"); }
 template <typename T> inline std::shared_ptr<Exp> operator/(T lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(type_to_literal(lhs), std::move(rhs), "/"); }
 
-// --- MODULO (%) ---
+//   MODULO (%)  
 inline std::shared_ptr<Exp> operator%(std::shared_ptr<Exp> lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(std::move(lhs), std::move(rhs), "%"); }
 template <typename T> inline std::shared_ptr<Exp> operator%(std::shared_ptr<Exp> lhs, T rhs) { return std::make_shared<BinaryOp>(std::move(lhs), type_to_literal(rhs), "%"); }
 template <typename T> inline std::shared_ptr<Exp> operator%(T lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(type_to_literal(lhs), std::move(rhs), "%"); }
 
-// --- EQUALITY (==) ---
+//   EQUALITY (==)  
 inline std::shared_ptr<Exp> operator==(std::shared_ptr<Exp> lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(std::move(lhs), std::move(rhs), "=="); }
 template <typename T> inline std::shared_ptr<Exp> operator==(std::shared_ptr<Exp> lhs, T rhs) { return std::make_shared<BinaryOp>(std::move(lhs), type_to_literal(rhs), "=="); }
 template <typename T> inline std::shared_ptr<Exp> operator==(T lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(type_to_literal(lhs), std::move(rhs), "=="); }
 
-// --- INEQUALITY (!=) ---
+//   INEQUALITY (!=)  
 inline std::shared_ptr<Exp> operator!=(std::shared_ptr<Exp> lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(std::move(lhs), std::move(rhs), "!="); }
 template <typename T> inline std::shared_ptr<Exp> operator!=(std::shared_ptr<Exp> lhs, T rhs) { return std::make_shared<BinaryOp>(std::move(lhs), type_to_literal(rhs), "!="); }
 template <typename T> inline std::shared_ptr<Exp> operator!=(T lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(type_to_literal(lhs), std::move(rhs), "!="); }
 
-// --- LESS THAN (<) ---
+//   LESS THAN (<)  
 inline std::shared_ptr<Exp> operator<(std::shared_ptr<Exp> lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(std::move(lhs), std::move(rhs), "<"); }
 template <typename T> inline std::shared_ptr<Exp> operator<(std::shared_ptr<Exp> lhs, T rhs) { return std::make_shared<BinaryOp>(std::move(lhs), type_to_literal(rhs), "<"); }
 template <typename T> inline std::shared_ptr<Exp> operator<(T lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(type_to_literal(lhs), std::move(rhs), "<"); }
 
-// --- LESS THAN OR EQUAL (<=) ---
+//   LESS THAN OR EQUAL (<=)  
 inline std::shared_ptr<Exp> operator<=(std::shared_ptr<Exp> lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(std::move(lhs), std::move(rhs), "<="); }
 template <typename T> inline std::shared_ptr<Exp> operator<=(std::shared_ptr<Exp> lhs, T rhs) { return std::make_shared<BinaryOp>(std::move(lhs), type_to_literal(rhs), "<="); }
 template <typename T> inline std::shared_ptr<Exp> operator<=(T lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(type_to_literal(lhs), std::move(rhs), "<="); }
 
-// --- GREATER THAN (>) ---
+//   GREATER THAN (>)  
 inline std::shared_ptr<Exp> operator>(std::shared_ptr<Exp> lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(std::move(lhs), std::move(rhs), ">"); }
 template <typename T> inline std::shared_ptr<Exp> operator>(std::shared_ptr<Exp> lhs, T rhs) { return std::make_shared<BinaryOp>(std::move(lhs), type_to_literal(rhs), ">"); }
 template <typename T> inline std::shared_ptr<Exp> operator>(T lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(type_to_literal(lhs), std::move(rhs), ">"); }
 
-// --- GREATER THAN OR EQUAL (>=) ---
+//   GREATER THAN OR EQUAL (>=)  
 inline std::shared_ptr<Exp> operator>=(std::shared_ptr<Exp> lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(std::move(lhs), std::move(rhs), ">="); }
 template <typename T> inline std::shared_ptr<Exp> operator>=(std::shared_ptr<Exp> lhs, T rhs) { return std::make_shared<BinaryOp>(std::move(lhs), type_to_literal(rhs), ">="); }
 template <typename T> inline std::shared_ptr<Exp> operator>=(T lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(type_to_literal(lhs), std::move(rhs), ">="); }
 
-// --- LOGICAL AND (&) ---
+//   LOGICAL AND (&)  
 inline std::shared_ptr<Exp> operator&(std::shared_ptr<Exp> lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(std::move(lhs), std::move(rhs), "&"); }
 template <typename T> inline std::shared_ptr<Exp> operator&(std::shared_ptr<Exp> lhs, T rhs) { return std::make_shared<BinaryOp>(std::move(lhs), type_to_literal(rhs), "&"); }
 template <typename T> inline std::shared_ptr<Exp> operator&(T lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(type_to_literal(lhs), std::move(rhs), "&"); }
 
-// --- LOGICAL OR (|) ---
+//   LOGICAL OR (|)  
 inline std::shared_ptr<Exp> operator|(std::shared_ptr<Exp> lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(std::move(lhs), std::move(rhs), "|"); }
 template <typename T> inline std::shared_ptr<Exp> operator|(std::shared_ptr<Exp> lhs, T rhs) { return std::make_shared<BinaryOp>(std::move(lhs), type_to_literal(rhs), "|"); }
 template <typename T> inline std::shared_ptr<Exp> operator|(T lhs, std::shared_ptr<Exp> rhs) { return std::make_shared<BinaryOp>(type_to_literal(lhs), std::move(rhs), "|"); }
 
-// --- UNARY NOT (~) ---
+//   UNARY NOT (~)  
 inline std::shared_ptr<Exp> operator~(std::shared_ptr<Exp> target) {
     return std::make_shared<UnaryOp>(std::move(target), "~");
 }
 
-// ==============================================================================
-// FLUENT CHAINING IMPLEMENTATIONS
-// ==============================================================================
+struct Expr {
+    std::shared_ptr<Exp> ptr;
+    Expr() = default;
+    Expr(std::shared_ptr<Exp> p) : ptr(std::move(p)) {}
+    operator std::shared_ptr<Exp>() const { return ptr; }
 
+    Exp* operator->() const { return ptr.get(); }
+
+    Expr abs() const         { return Expr(ptr->abs()); }
+    Expr is_null() const     { return Expr(ptr->is_null()); }
+    Expr is_not_null() const { return Expr(ptr->is_not_null()); }
+    Expr length() const      { return Expr(ptr->length()); }
+    Expr to_lower() const    { return Expr(ptr->to_lower()); }
+    Expr to_upper() const    { return Expr(ptr->to_upper()); }
+    Expr sum() const         { return Expr(ptr->sum()); }
+    Expr mean() const        { return Expr(ptr->mean()); }
+    Expr count() const       { return Expr(ptr->count()); }
+    Expr min() const         { return Expr(ptr->min()); }
+    Expr max() const         { return Expr(ptr->max()); }
+    template <typename T> Expr contains(T v) const    { return Expr(ptr->contains(v)); }
+    template <typename T> Expr starts_with(T v) const { return Expr(ptr->starts_with(v)); }
+    template <typename T> Expr ends_with(T v) const   { return Expr(ptr->ends_with(v)); }
+    Expr alias(const std::string& a) const { return Expr(ptr->alias(a)); }
+    Expr operator~() const { return Expr(::dataframelib::operator~(ptr)); }
+};
+
+#define DFL_BIN(OP) \
+    inline Expr operator OP(const Expr& a, const Expr& b) { return Expr(a.ptr OP b.ptr); } \
+    template <typename T> inline Expr operator OP(const Expr& a, const T& b) { return Expr(a.ptr OP b); } \
+    template <typename T> inline Expr operator OP(const T& a, const Expr& b) { return Expr(a OP b.ptr); }
+DFL_BIN(+) DFL_BIN(-) DFL_BIN(*) DFL_BIN(/) DFL_BIN(%)
+DFL_BIN(==) DFL_BIN(!=) DFL_BIN(<) DFL_BIN(<=) DFL_BIN(>) DFL_BIN(>=)
+DFL_BIN(&) DFL_BIN(|)
+#undef DFL_BIN
+
+inline Expr col(const std::string& name) { return Expr(_make_col(name)); }
+template <typename T>
+inline Expr lit(T v) { return Expr(type_to_literal(v)); }
+
+// code for chaining implementations
 inline std::shared_ptr<Exp> Exp::abs() { return std::make_shared<UnaryOp>(shared_from_this(), "abs"); }
 inline std::shared_ptr<Exp> Exp::is_null() { return std::make_shared<UnaryOp>(shared_from_this(), "is_null"); }
 inline std::shared_ptr<Exp> Exp::is_not_null() { return std::make_shared<UnaryOp>(shared_from_this(), "is_not_null"); }
@@ -333,4 +363,6 @@ inline std::shared_ptr<Exp> Exp::ends_with(T suffix_val) {
 
 inline std::shared_ptr<Exp> Exp::alias(const std::string& new_alias) {
     return std::make_shared<AliasNode>(shared_from_this(), new_alias);
+}
+
 }

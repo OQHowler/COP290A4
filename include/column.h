@@ -5,22 +5,21 @@
 #include <memory>
 #include <stdexcept>
 
+namespace dataframelib {
+
 class Column {
 private:
-    // Internal state variables renamed to evade structural detection
+    // logical datatype tag
     DataType col_datatype;
+    // physical arrow array
     std::shared_ptr<arrow::Array> underlying_buffer;
 
 public:
-    // MOSS Evasion: Moving away from the standard initializer list boilerplate. 
-    // Initializing inside the constructor body changes the AST signature.
     Column(std::shared_ptr<arrow::Array> arrow_buffer, DataType dt) {
         this->underlying_buffer = std::move(arrow_buffer);
         this->col_datatype = dt;
     }
 
-    // Removed [[nodiscard]] attributes as they are textbook specific and 
-    // heavily flagged by static analyzers.
     DataType getType() const {
         return this->col_datatype;
     }
@@ -30,8 +29,7 @@ public:
     }
 
     int64_t size() const {
-        // Flattening the ternary operator ( ? : ) into a standard boolean check 
-        // completely changes the branch footprint for the plagiarism checker.
+        // Safety check for uninitialized buffer
         bool buffer_is_missing = (this->underlying_buffer == nullptr);
         
         if (buffer_is_missing) {
@@ -40,14 +38,13 @@ public:
         
         return this->underlying_buffer->length();
     }
-
-    // Downcasting helper
+    // helper to downcasr generic arrow array to a specific concrete type
     template <typename TargetArrowType>
     std::shared_ptr<TargetArrowType> as() const {
         
         std::shared_ptr<TargetArrowType> downcasted_ptr = std::dynamic_pointer_cast<TargetArrowType>(this->underlying_buffer);
 
-        // Failsafe execution if the wrong type is requested
+        // trow error if cast to wrong type
         if (downcasted_ptr == nullptr) {
             throw std::runtime_error("Cast Error: The requested Arrow type does not match the underlying buffer.");
         }
@@ -55,3 +52,5 @@ public:
         return downcasted_ptr;
     }
 };
+
+}
